@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 # Környezeti változók betöltése
 load_dotenv()
-
+discord.VoiceClient = None
 # Intents beállítása
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
