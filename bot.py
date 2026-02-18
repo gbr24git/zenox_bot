@@ -6,11 +6,18 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Voice support kikapcsolása - nem kell nekünk!
+discord.VoiceClient.warn_nacl = False
+
 # Környezeti változók betöltése
 load_dotenv()
-discord.VoiceClient = None
+
 # Intents beállítása
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.presences = True
+
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Adatok tárolása (warnings, tickets)
@@ -30,6 +37,7 @@ def save_data(filename, data):
 
 warnings = load_data('warnings')
 ticket_settings = load_data('ticket_settings')
+trades = load_data('trades')
 
 # ============= MODERÁCIÓS PARANCSOK =============
 
@@ -37,6 +45,9 @@ ticket_settings = load_data('ticket_settings')
 @app_commands.describe(tag="A felhasználó akit némítani szeretnél", ido="Idő percben", ok="Indok")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def mute(interaction: discord.Interaction, tag: discord.Member, ido: int, ok: str = "Nincs megadva"):
+    # Defer hogy ne legyen timeout
+    await interaction.response.defer()
+    
     await tag.timeout(discord.utils.utcnow() + discord.timedelta(minutes=ido), reason=ok)
     
     embed = discord.Embed(
@@ -49,7 +60,7 @@ async def mute(interaction: discord.Interaction, tag: discord.Member, ido: int, 
     embed.add_field(name="Időtartam", value=f"{ido} perc", inline=True)
     embed.add_field(name="Indok", value=ok, inline=False)
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="unmute", description="Szüntesd meg a némítást")
 @app_commands.describe(tag="A felhasználó akit feloldanál")
@@ -196,14 +207,22 @@ async def say(interaction: discord.Interaction, uzenet: str):
 @app_commands.describe(
     cim="Az embed címe",
     leiras="Az embed leírása",
-    szin="Szín hex kódban (pl: ff0000)"
+    szin="Szín hex kódban (pl: ff0000 piros, 00ff00 zöld, 0000ff kék)"
 )
 @app_commands.checks.has_permissions(manage_messages=True)
 async def send_embed(interaction: discord.Interaction, cim: str, leiras: str, szin: str = "3498db"):
+    # Szín konvertálása
     try:
-        color = discord.Color(int(szin, 16))
-    except:
+        # Ha # jellel kezdődik, távolítsd el
+        if szin.startswith('#'):
+            szin = szin[1:]
+        # Konvertálás int-re 16-os számrendszerben
+        color_int = int(szin, 16)
+        color = discord.Color(color_int)
+    except ValueError:
+        # Ha hibás a szín, használj kéket
         color = discord.Color.blue()
+        await interaction.response.send_message("⚠️ Hibás színkód! Kék színt használok alapértelmezetten.", ephemeral=True)
     
     embed = discord.Embed(
         title=cim,
@@ -213,8 +232,93 @@ async def send_embed(interaction: discord.Interaction, cim: str, leiras: str, sz
     )
     embed.set_footer(text=f"Készítette: {interaction.user.name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     
-    await interaction.response.send_message("✅ Embed elküldve!", ephemeral=True)
+    # Ha már küldtünk warning-ot a színről, ne küldjünk újra
+    if color != discord.Color.blue() or not szin.startswith('#'):
+        await interaction.response.send_message("✅ Embed elküldve!", ephemeral=True)
+    
     await interaction.channel.send(embed=embed)
+
+# ============= TRADE PROOF RENDSZER =============
+
+@bot.tree.command(name="trade-proof", description="Rögzítsd a sikeres trade-et")
+@app_commands.describe(
+    middleman="A middleman neve",
+    tradeelo="Aki tradelt a middleman-nel"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def trade_proof(interaction: discord.Interaction, middleman: discord.Member, tradeelo: discord.Member):
+    guild_id = str(interaction.guild.id)
+    
+    # Trade számlálás
+    if guild_id not in trades:
+        trades[guild_id] = {"count": 0, "history": []}
+    
+    # Trade szám növelése
+    trades[guild_id]["count"] += 1
+    trade_number = trades[guild_id]["count"]
+    
+    # Trade rögzítése
+    trade_data = {
+        "trade_szam": trade_number,
+        "middleman": middleman.name,
+        "middleman_id": middleman.id,
+        "tradeelo": tradeelo.name,
+        "tradeelo_id": tradeelo.id,
+        "datum": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "registered_by": interaction.user.name
+    }
+    
+    trades[guild_id]["history"].append(trade_data)
+    save_data('trades', trades)
+    
+    # Válasz üzenet
+    embed = discord.Embed(
+        title="✅ Sikeres Trade",
+        color=discord.Color.green(),
+        timestamp=datetime.now()
+    )
+    embed.add_field(name="Trade szám", value=f"#{trade_number}", inline=True)
+    embed.add_field(name="Middleman", value=middleman.mention, inline=True)
+    embed.add_field(name="Tradeelő", value=tradeelo.mention, inline=True)
+    embed.set_footer(text="Kérjük küldd el a video proof-ot alább!")
+    
+    await interaction.response.send_message(
+        f"✅ **Sikeres Trade**\n\n"
+        f"📊 **Trade szám:** #{trade_number}\n"
+        f"🛡️ **Middleman:** {middleman.mention}\n"
+        f"💱 **Tradeelő:** {tradeelo.mention}\n\n"
+        f"📹 Kérjük küldd el a video proof-ot!",
+        embed=embed
+    )
+
+@bot.tree.command(name="trade-stats", description="Trade statisztikák megtekintése")
+async def trade_stats(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    
+    if guild_id not in trades or trades[guild_id]["count"] == 0:
+        await interaction.response.send_message("❌ Még nem volt trade rögzítve!")
+        return
+    
+    total_trades = trades[guild_id]["count"]
+    
+    embed = discord.Embed(
+        title="📊 Trade Statisztikák",
+        description=f"Összes trade: **{total_trades}**",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    # Utolsó 5 trade
+    recent_trades = trades[guild_id]["history"][-5:]
+    
+    for trade in reversed(recent_trades):
+        embed.add_field(
+            name=f"Trade #{trade['trade_szam']} - {trade['datum']}",
+            value=f"**Middleman:** {trade['middleman']}\n**Tradeelő:** {trade['tradeelo']}",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
 
 # ============= TICKET RENDSZER =============
 
@@ -311,28 +415,30 @@ if LEAVE_CHANNEL_ID:
 async def on_member_join(member):
     if WELCOME_CHANNEL_ID:
         channel = bot.get_channel(WELCOME_CHANNEL_ID)
-        embed = discord.Embed(
-            title="👋 Üdvözlünk!",
-            description=f"Üdv a szerveren, {member.mention}!\n\nMost már **{member.guild.member_count}** tagunk van!",
-            color=discord.Color.green(),
-            timestamp=datetime.now()
-        )
-        embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
-        embed.set_footer(text=f"ID: {member.id}")
-        await channel.send(embed=embed)
+        if channel:
+            embed = discord.Embed(
+                title="👋 Üdvözlünk!",
+                description=f"Üdv a szerveren, {member.mention}!\n\nMost már **{member.guild.member_count}** tagunk van!",
+                color=discord.Color.green(),
+                timestamp=datetime.now()
+            )
+            embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+            embed.set_footer(text=f"ID: {member.id}")
+            await channel.send(embed=embed)
 
 @bot.event
 async def on_member_remove(member):
     if LEAVE_CHANNEL_ID:
         channel = bot.get_channel(LEAVE_CHANNEL_ID)
-        embed = discord.Embed(
-            title="👋 Viszlát!",
-            description=f"**{member.name}** elhagyta a szervert.\n\nMost már csak **{member.guild.member_count}** tagunk van.",
-            color=discord.Color.red(),
-            timestamp=datetime.now()
-        )
-        embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
-        await channel.send(embed=embed)
+        if channel:
+            embed = discord.Embed(
+                title="👋 Viszlát!",
+                description=f"**{member.name}** elhagyta a szervert.\n\nMost már csak **{member.guild.member_count}** tagunk van.",
+                color=discord.Color.red(),
+                timestamp=datetime.now()
+            )
+            embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+            await channel.send(embed=embed)
 
 # ============= ÜZENETEKRE REAGÁLÁS =============
 
@@ -378,4 +484,30 @@ if not TOKEN:
     print("Hozz létre egy .env fájlt és add hozzá: DISCORD_TOKEN=ide_a_tokened")
     exit(1)
 
+# ============= WEBSERVER (24/7 működéshez - UptimeRobot) =============
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "✅ Zenox Bot online és fut!"
+
+@app.route('/ping')
+def ping():
+    return "pong"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# Webserver indítása
+print("🌐 Webserver indítása...")
+keep_alive()
+
+# Bot indítása
 bot.run(TOKEN)
